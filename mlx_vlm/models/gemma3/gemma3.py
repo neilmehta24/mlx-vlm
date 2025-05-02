@@ -251,12 +251,12 @@ class Model(nn.Module):
             pad_mask_expanded, mx.zeros_like(final_embedding), final_embedding
         )
 
-        # final_embedding = mlx_masked_scatter(
-        #     final_embedding, image_mask_expanded, scaled_image_features
-        # )
-        final_embedding = torch_masked_scatter(
+        final_embedding = mlx_masked_scatter(
             final_embedding, image_mask_expanded, scaled_image_features
         )
+        # final_embedding = torch_masked_scatter(
+        #     final_embedding, image_mask_expanded, scaled_image_features
+        # )
 
         attention_mask_expanded_1 = mx.expand_dims(attention_mask, 1)
         attention_mask_expanded_2 = mx.expand_dims(attention_mask, 2)
