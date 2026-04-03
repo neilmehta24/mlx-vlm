@@ -506,14 +506,15 @@ class VisionModel(nn.Module):
             padding_positions,
         )
 
+        # Ref: transformers/src/transformers/masking_utils.py::
+        # create_bidirectional_mask / padding_mask_function / sdpa_mask.
+        # Bug fixed: HF only applies the 2D padding mask on the key/value axis for
+        # bidirectional SDPA. The old MLX path masked both queries and keys via an
+        # outer product, which incorrectly prevented padded query rows from attending
+        # to valid image patches and caused the remaining encoder mismatch.
         # Build bidirectional attention mask [B, 1, L, L] for SDPA
         valid_mask = ~padding_positions  # True = valid
-        attn_mask = mx.expand_dims(valid_mask, 1) * mx.expand_dims(valid_mask, 2)
-        neg_inf = mx.array(float("-inf"), dtype=inputs_embeds.dtype)
-        attn_mask = mx.where(
-            attn_mask, mx.array(0.0, dtype=inputs_embeds.dtype), neg_inf
-        )
-        attn_mask = mx.expand_dims(attn_mask, 1)  # [B, 1, L, L] for head broadcasting
+        attn_mask = mx.expand_dims(mx.expand_dims(valid_mask, 1), 1)
 
         # Run transformer layers
         hidden_states = self.encoder(inputs_embeds, patch_positions, attn_mask)

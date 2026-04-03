@@ -2101,6 +2101,48 @@ class TestModels(unittest.TestCase):
         for actual, expected_value in zip(pooled[0, :, 0].tolist(), expected):
             self.assertAlmostEqual(actual, expected_value, places=5)
 
+    def test_gemma4_uses_bool_bidirectional_key_mask(self):
+        from mlx_vlm.models import gemma4
+
+        class CaptureEncoder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.last_mask = None
+
+            def __call__(self, hidden_states, positions, mask):
+                self.last_mask = mask
+                return hidden_states
+
+        vision_config = gemma4.VisionConfig(
+            model_type="gemma4_vision",
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            patch_size=16,
+            pooling_kernel_size=2,
+            default_output_length=4,
+            position_embedding_size=64,
+            use_clipped_linears=False,
+        )
+        vision_tower = gemma4.VisionModel(vision_config)
+        capture_encoder = CaptureEncoder()
+        vision_tower.encoder = capture_encoder
+
+        _ = vision_tower(mx.zeros((1, 3, 48, 48), dtype=mx.float32))
+
+        self.assertIsNotNone(capture_encoder.last_mask)
+        self.assertEqual(
+            capture_encoder.last_mask.shape,
+            (1, 1, 1, vision_tower.max_patches),
+        )
+        self.assertEqual(capture_encoder.last_mask.dtype, mx.bool_)
+        self.assertTrue(bool(capture_encoder.last_mask[0, 0, 0, 0].item()))
+        self.assertFalse(bool(capture_encoder.last_mask[0, 0, 0, -1].item()))
+
     def test_gemma4_moe(self):
         """Gemma 4 MoE variant: MoE, K-eq-V, no per-layer inputs."""
         from mlx_vlm.models import gemma4
