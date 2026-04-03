@@ -3,7 +3,6 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.nn import RMSNorm
 
 from ..base import (
     LanguageModelOutput,
@@ -23,7 +22,35 @@ class RMSNormNoScale(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        return mx.fast.rms_norm(x, None, self.eps)
+        # Ref: transformers/src/transformers/models/gemma4/modeling_gemma4.py::
+        # Gemma4RMSNorm.forward (with_scale=False).
+        # Bug fixed: Gemma-4 text norms must run in float32 to match HF. The old
+        # MLX fused RMSNorm path kept this lower precision and introduced a small
+        # mismatch at every text block and per-layer-input projection.
+        x_float = x.astype(mx.float32)
+        mean_squared = mx.mean(x_float * x_float, axis=-1, keepdims=True) + self.eps
+        return (x_float * mx.power(mean_squared, -0.5)).astype(x.dtype)
+
+
+class RMSNorm(nn.Module):
+    """Gemma4 RMSNorm with learnable scale in full float32."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = mx.ones((dim,))
+        self.eps = eps
+
+    def __call__(self, x: mx.array) -> mx.array:
+        # Ref: transformers/src/transformers/models/gemma4/modeling_gemma4.py::
+        # Gemma4RMSNorm.forward (with_scale=True).
+        # Bug fixed: Gemma-4 text RMSNorms used MLX's generic kernel, but HF runs
+        # them in float32 before re-casting. That drift accumulated across the text
+        # stack after the multimodal handoff bug was fixed.
+        x_float = x.astype(mx.float32)
+        mean_squared = mx.mean(x_float * x_float, axis=-1, keepdims=True) + self.eps
+        normed = x_float * mx.power(mean_squared, -0.5)
+        result = normed * self.weight.astype(mx.float32)
+        return result.astype(x.dtype)
 
 
 class RMSNormZeroShift(nn.Module):
@@ -35,7 +62,15 @@ class RMSNormZeroShift(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        return mx.fast.rms_norm(x, self.weight, self.eps)
+        # Ref: transformers/src/transformers/models/gemma4/modeling_gemma4.py::
+        # Gemma4RMSNorm.forward with scale_shift=0.0 semantics.
+        # Bug fixed: this per-layer-input norm also needs the same float32 Gemma4
+        # RMSNorm path as HF; the old fused MLX kernel introduced avoidable drift.
+        x_float = x.astype(mx.float32)
+        mean_squared = mx.mean(x_float * x_float, axis=-1, keepdims=True) + self.eps
+        normed = x_float * mx.power(mean_squared, -0.5)
+        result = normed * self.weight.astype(mx.float32)
+        return result.astype(x.dtype)
 
 
 @partial(mx.compile, shapeless=True)
@@ -470,10 +505,15 @@ class Gemma4TextModel(nn.Module):
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
+            h = h * self.embed_scale
         else:
+            # Ref: transformers/src/transformers/models/gemma4/modeling_gemma4.py::
+            # Gemma4TextModel.forward.
+            # Bug fixed: HF treats provided `inputs_embeds` as final model-space
+            # embeddings. The old MLX path multiplied them by `embed_scale` again,
+            # which incorrectly amplified multimodal soft tokens that had already
+            # been projected into text space.
             h = inputs_embeds
-
-        h = h * self.embed_scale
 
         if self.hidden_size_per_layer_input:
             if inputs is not None and per_layer_inputs is None:

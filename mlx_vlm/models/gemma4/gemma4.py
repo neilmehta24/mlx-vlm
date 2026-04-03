@@ -85,18 +85,30 @@ class Model(nn.Module):
             audio_features = input_features
         if input_features_mask is not None and audio_mask is None:
             audio_mask = ~input_features_mask.astype(mx.bool_)
-        inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+
+        image_mask_ids = input_ids == self.config.image_token_id
+        audio_mask_ids = input_ids == self.config.audio_token_id
+        multimodal_mask = image_mask_ids | audio_mask_ids
+        llm_input_ids = mx.where(
+            multimodal_mask,
+            mx.full(input_ids.shape, self.config.pad_token_id, dtype=input_ids.dtype),
+            input_ids,
+        )
+
+        # Ref: transformers/src/transformers/models/gemma4/modeling_gemma4.py::
+        # Gemma4Model.forward.
+        # Bug fixed: HF prepares already-scaled text embeddings from PAD-replaced
+        # multimodal placeholder ids before scattering image/audio soft tokens.
+        # The old MLX path returned unscaled text embeddings here and relied on the
+        # text model to multiply everything later, which incorrectly scaled the
+        # inserted image/audio features by sqrt(hidden_size).
+        inputs_embeds = self.language_model.model.embed_tokens(llm_input_ids)
+        inputs_embeds = inputs_embeds * self.language_model.model.embed_scale
 
         per_layer_inputs = None
         if self.language_model.model.hidden_size_per_layer_input:
-            image_mask_ids = input_ids == self.config.image_token_id
-            audio_mask_ids = input_ids == self.config.audio_token_id
-            text_mask = ~(image_mask_ids | audio_mask_ids)
-            per_layer_inputs_tokens = mx.where(
-                text_mask, input_ids, mx.zeros_like(input_ids)
-            )
             per_layer_inputs = self.language_model.model.get_per_layer_inputs(
-                per_layer_inputs_tokens
+                llm_input_ids
             )
 
         if pixel_values is not None:
@@ -104,7 +116,7 @@ class Model(nn.Module):
             image_features = self.embed_vision(image_features)
             image_features = image_features.astype(inputs_embeds.dtype)
 
-            image_mask = input_ids == self.config.image_token_id
+            image_mask = image_mask_ids
             image_mask_expanded = mx.expand_dims(image_mask, -1)
             image_mask_expanded = mx.broadcast_to(
                 image_mask_expanded, inputs_embeds.shape
@@ -126,7 +138,7 @@ class Model(nn.Module):
             audio_encodings = self.embed_audio(audio_encodings)
             audio_encodings = audio_encodings.astype(inputs_embeds.dtype)
 
-            audio_token_mask = input_ids == self.config.audio_token_id
+            audio_token_mask = audio_mask_ids
             audio_mask_expanded = mx.expand_dims(audio_token_mask, -1)
             audio_mask_expanded = mx.broadcast_to(
                 audio_mask_expanded, inputs_embeds.shape

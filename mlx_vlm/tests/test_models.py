@@ -2281,6 +2281,174 @@ class TestModels(unittest.TestCase):
             mx.bfloat16,
         )
 
+    def test_gemma4_text_rmsnorm_variants_match_float32_reference(self):
+        from mlx_vlm.models.gemma4.language import RMSNorm, RMSNormNoScale, RMSNormZeroShift
+
+        hidden_states = mx.array(
+            [[0.125, -13.75, 7.8125, -0.03125]],
+            dtype=mx.float16,
+        )
+        hidden_states_np = np.array(hidden_states.tolist(), dtype=np.float32)
+        mean_squared = np.mean(hidden_states_np * hidden_states_np, axis=-1, keepdims=True) + 1e-6
+        base_expected = hidden_states_np * np.power(mean_squared, -0.5)
+
+        no_scale = RMSNormNoScale(dim=4, eps=1e-6)
+        no_scale_output = no_scale(hidden_states)
+        np.testing.assert_allclose(
+            np.array(no_scale_output.tolist(), dtype=np.float16),
+            base_expected.astype(np.float16),
+            rtol=0.0,
+            atol=1e-4,
+        )
+
+        weight = np.array([1.0, 0.5, 1.5, 2.0], dtype=np.float32)
+
+        rmsnorm = RMSNorm(dim=4, eps=1e-6)
+        rmsnorm.weight = mx.array(weight, dtype=mx.float16)
+        rmsnorm_output = rmsnorm(hidden_states)
+        np.testing.assert_allclose(
+            np.array(rmsnorm_output.tolist(), dtype=np.float16),
+            (base_expected * weight).astype(np.float16),
+            rtol=0.0,
+            atol=1e-4,
+        )
+
+        zero_shift = RMSNormZeroShift(dim=4, eps=1e-6)
+        zero_shift.weight = mx.array(weight, dtype=mx.float16)
+        zero_shift_output = zero_shift(hidden_states)
+        np.testing.assert_allclose(
+            np.array(zero_shift_output.tolist(), dtype=np.float16),
+            (base_expected * weight).astype(np.float16),
+            rtol=0.0,
+            atol=1e-4,
+        )
+
+    def test_gemma4_text_model_preserves_provided_inputs_embeds(self):
+        from mlx_vlm.models import gemma4
+        from mlx_vlm.models.gemma4.language import Gemma4TextModel
+
+        class Identity(nn.Module):
+            def __call__(self, x):
+                return x
+
+        text_model = Gemma4TextModel(
+            gemma4.TextConfig(
+                hidden_size=4,
+                num_hidden_layers=0,
+                intermediate_size=8,
+                num_attention_heads=1,
+                num_key_value_heads=1,
+                head_dim=4,
+                global_head_dim=4,
+                vocab_size=16,
+                hidden_size_per_layer_input=0,
+                num_kv_shared_layers=0,
+                sliding_window=32,
+                sliding_window_pattern=1,
+            )
+        )
+        text_model.norm = Identity()
+
+        inputs_embeds = mx.array(
+            [[[1.0, -2.0, 3.5, -4.5]]],
+            dtype=mx.float32,
+        )
+        outputs = text_model(
+            inputs_embeds=inputs_embeds,
+            mask=mx.ones((1, 1, 1, 1), dtype=mx.bool_),
+        )
+
+        np.testing.assert_allclose(
+            np.array(outputs.tolist(), dtype=np.float32),
+            np.array(inputs_embeds.tolist(), dtype=np.float32),
+            rtol=0.0,
+            atol=1e-6,
+        )
+
+    def test_gemma4_model_get_input_embeddings_scales_text_before_scattering_image_features(
+        self,
+    ):
+        from mlx_vlm.models import gemma4
+
+        class DummyVisionTower(nn.Module):
+            def __init__(self, output):
+                super().__init__()
+                self.output = output
+
+            def __call__(self, pixel_values):
+                return self.output
+
+        class Identity(nn.Module):
+            def __call__(self, x):
+                return x
+
+        model = gemma4.Model(
+            gemma4.ModelConfig(
+                text_config=gemma4.TextConfig(
+                    hidden_size=4,
+                    num_hidden_layers=1,
+                    intermediate_size=8,
+                    num_attention_heads=1,
+                    num_key_value_heads=1,
+                    head_dim=4,
+                    global_head_dim=4,
+                    vocab_size=16,
+                    hidden_size_per_layer_input=0,
+                    num_kv_shared_layers=0,
+                    sliding_window=32,
+                    sliding_window_pattern=1,
+                ),
+                vision_config=gemma4.VisionConfig(
+                    hidden_size=4,
+                    num_hidden_layers=1,
+                    intermediate_size=8,
+                    num_attention_heads=1,
+                    num_key_value_heads=1,
+                    head_dim=4,
+                    patch_size=16,
+                    pooling_kernel_size=2,
+                    default_output_length=4,
+                    position_embedding_size=64,
+                    use_clipped_linears=False,
+                ),
+            )
+        )
+
+        embedding_weights = np.arange(16 * 4, dtype=np.float32).reshape(16, 4)
+        model.language_model.model.embed_tokens.weight = mx.array(embedding_weights)
+        model.vision_tower = DummyVisionTower(
+            mx.array([[[10.0, 20.0, 30.0, 40.0]]], dtype=mx.float32)
+        )
+        model.embed_vision = Identity()
+
+        input_ids = mx.array(
+            [[5, model.config.image_token_id, 7]],
+            dtype=mx.int32,
+        )
+        outputs = model.get_input_embeddings(
+            input_ids=input_ids,
+            pixel_values=mx.zeros((1, 3, 16, 16), dtype=mx.float32),
+        )
+
+        embed_scale = model.language_model.model.embed_scale
+        expected = np.array(
+            [
+                [
+                    embedding_weights[5] * embed_scale,
+                    [10.0, 20.0, 30.0, 40.0],
+                    embedding_weights[7] * embed_scale,
+                ]
+            ],
+            dtype=np.float32,
+        )
+
+        np.testing.assert_allclose(
+            np.array(outputs.inputs_embeds.tolist(), dtype=np.float32),
+            expected,
+            rtol=0.0,
+            atol=1e-5,
+        )
+
     def test_gemma4_moe(self):
         """Gemma 4 MoE variant: MoE, K-eq-V, no per-layer inputs."""
         from mlx_vlm.models import gemma4
