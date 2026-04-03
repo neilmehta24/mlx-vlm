@@ -3,6 +3,7 @@ import unittest
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx.utils import tree_map
 
 
@@ -2142,6 +2143,143 @@ class TestModels(unittest.TestCase):
         self.assertEqual(capture_encoder.last_mask.dtype, mx.bool_)
         self.assertTrue(bool(capture_encoder.last_mask[0, 0, 0, 0].item()))
         self.assertFalse(bool(capture_encoder.last_mask[0, 0, 0, -1].item()))
+
+    def test_gemma4_vision_block_rmsnorm_matches_float32_reference(self):
+        from mlx_vlm.models.gemma4.vision import RMSNorm
+
+        rmsnorm = RMSNorm(dim=4, eps=1e-6)
+        rmsnorm.weight = mx.array([1.0, 0.5, 1.5, 2.0], dtype=mx.float16)
+
+        hidden_states = mx.array(
+            [[0.125, -13.75, 7.8125, -0.03125]],
+            dtype=mx.float16,
+        )
+        output = rmsnorm(hidden_states)
+
+        hidden_states_np = np.array(hidden_states.tolist(), dtype=np.float32)
+        weight_np = np.array(rmsnorm.weight.tolist(), dtype=np.float32)
+        mean_squared = np.mean(hidden_states_np * hidden_states_np, axis=-1, keepdims=True) + rmsnorm.eps
+        expected = (hidden_states_np * np.power(mean_squared, -0.5) * weight_np).astype(np.float16)
+
+        np.testing.assert_allclose(
+            np.array(output.tolist(), dtype=np.float16),
+            expected,
+            rtol=0.0,
+            atol=1e-4,
+        )
+
+    def test_gemma4_vision_sanitize_preserves_bfloat16_weights(self):
+        from mlx_vlm.models import gemma4
+
+        weights = {
+            "vision_tower.patch_embedder.input_proj.weight": mx.ones(
+                (2, 2), dtype=mx.bfloat16
+            ),
+            "patch_embedder.input_proj.weight": mx.ones((2, 2), dtype=mx.bfloat16),
+            "vision_tower.encoder.layers.0.input_layernorm.weight": mx.ones(
+                (2,), dtype=mx.bfloat16
+            ),
+            "language_model.model.embed_tokens.weight": mx.ones(
+                (2, 2), dtype=mx.bfloat16
+            ),
+        }
+
+        sanitized = gemma4.VisionModel.sanitize(weights)
+
+        self.assertEqual(
+            sanitized["vision_tower.patch_embedder.input_proj.weight"].dtype,
+            mx.bfloat16,
+        )
+        self.assertEqual(
+            sanitized["patch_embedder.input_proj.weight"].dtype,
+            mx.bfloat16,
+        )
+        self.assertEqual(
+            sanitized["vision_tower.encoder.layers.0.input_layernorm.weight"].dtype,
+            mx.bfloat16,
+        )
+        self.assertEqual(
+            sanitized["language_model.model.embed_tokens.weight"].dtype,
+            mx.bfloat16,
+        )
+
+    def test_gemma4_multimodal_embedder_uses_pre_projection_norm(self):
+        from mlx_vlm.models.gemma4.gemma4 import MultimodalEmbedder
+
+        embedder = MultimodalEmbedder(embedding_dim=2, text_hidden_size=2, eps=1e-6)
+        embedder.embedding_projection.weight = mx.array(
+            [[1.0, 0.0], [1.0, 1.0]], dtype=mx.float32
+        )
+
+        inputs = mx.array([[3.0, 4.0]], dtype=mx.float32)
+        outputs = embedder(inputs)
+
+        inputs_np = np.array(inputs.tolist(), dtype=np.float32)
+        mean_squared = np.mean(inputs_np * inputs_np, axis=-1, keepdims=True) + 1e-6
+        normed_inputs = inputs_np * np.power(mean_squared, -0.5)
+        projection = np.array([[1.0, 0.0], [1.0, 1.0]], dtype=np.float32)
+        expected = normed_inputs @ projection.T
+
+        np.testing.assert_allclose(
+            np.array(outputs.tolist(), dtype=np.float32),
+            expected,
+            rtol=0.0,
+            atol=1e-5,
+        )
+
+    def test_gemma4_model_sanitize_preserves_embed_vision_bfloat16_weights(self):
+        from mlx_vlm.models import gemma4
+
+        model = gemma4.Model(
+            gemma4.ModelConfig(
+                text_config=gemma4.TextConfig(
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_key_value_heads=1,
+                    head_dim=8,
+                    global_head_dim=8,
+                    vocab_size=32,
+                    num_kv_shared_layers=0,
+                    sliding_window=32,
+                    sliding_window_pattern=1,
+                ),
+                vision_config=gemma4.VisionConfig(
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    head_dim=8,
+                    patch_size=16,
+                    pooling_kernel_size=2,
+                    default_output_length=4,
+                    position_embedding_size=64,
+                    use_clipped_linears=False,
+                ),
+            )
+        )
+
+        sanitized = model.sanitize(
+            {
+                "model.embed_vision.embedding_projection.weight": mx.ones(
+                    (16, 16), dtype=mx.bfloat16
+                ),
+                "model.language_model.embed_tokens.weight": mx.ones(
+                    (32, 16), dtype=mx.bfloat16
+                ),
+            }
+        )
+
+        self.assertEqual(
+            sanitized["embed_vision.embedding_projection.weight"].dtype,
+            mx.bfloat16,
+        )
+        self.assertEqual(
+            sanitized["language_model.model.embed_tokens.weight"].dtype,
+            mx.bfloat16,
+        )
 
     def test_gemma4_moe(self):
         """Gemma 4 MoE variant: MoE, K-eq-V, no per-layer inputs."""

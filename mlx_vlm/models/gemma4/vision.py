@@ -82,7 +82,10 @@ class VisionRMSNormNoScale(nn.Module):
 
 
 class RMSNorm(nn.Module):
-    """Standard Gemma4 RMSNorm: weight applied directly."""
+    """Standard Gemma4 RMSNorm: weight applied directly.
+
+    Matches PyTorch Gemma4RMSNorm(with_scale=True): full float32 computation.
+    """
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -90,7 +93,16 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        return mx.fast.rms_norm(x, self.weight, self.eps)
+        # Ref: transformers/src/transformers/models/gemma4/modeling_gemma4.py::
+        # Gemma4RMSNorm.forward.
+        # Bug fixed: the vision block RMSNorms used MLX's fused kernel, but HF runs these
+        # norms in float32. That lower-precision MLX path introduced a small valid-token
+        # mismatch at every vision block and accumulated across the encoder.
+        x_float = x.astype(mx.float32)
+        mean_squared = mx.mean(x_float * x_float, axis=-1, keepdims=True) + self.eps
+        normed = x_float * mx.power(mean_squared, -0.5)
+        result = normed * self.weight.astype(mx.float32)
+        return result.astype(x.dtype)
 
 
 def _rotate_half(x):

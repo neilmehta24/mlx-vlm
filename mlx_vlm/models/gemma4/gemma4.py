@@ -27,11 +27,15 @@ class MultimodalEmbedder(nn.Module):
         self.embedding_projection = nn.Linear(
             embedding_dim, text_hidden_size, bias=False
         )
-        self.embedding_post_projection_norm = RMSNormNoScale(text_hidden_size, eps=eps)
+        self.embedding_pre_projection_norm = RMSNormNoScale(embedding_dim, eps=eps)
 
     def __call__(self, inputs_embeds: mx.array) -> mx.array:
-        proj = self.embedding_projection(inputs_embeds)
-        return self.embedding_post_projection_norm(proj)
+        # Ref: transformers/src/transformers/models/gemma4/modeling_gemma4.py::
+        # Gemma4MultimodalEmbedder.forward.
+        # Bug fixed: MLX normalized after projecting vision features into text space,
+        # but HF normalizes the multimodal features before projection.
+        normed_inputs = self.embedding_pre_projection_norm(inputs_embeds)
+        return self.embedding_projection(normed_inputs)
 
 
 class Model(nn.Module):
