@@ -2033,6 +2033,74 @@ class TestModels(unittest.TestCase):
             (1, 6, config_with_audio.text_config.vocab_size),
         )
 
+    def test_gemma4_padding_semantics(self):
+        from mlx_vlm.models import gemma4
+
+        vision_config = gemma4.VisionConfig(
+            model_type="gemma4_vision",
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            patch_size=16,
+            pooling_kernel_size=2,
+            default_output_length=4,
+            position_embedding_size=64,
+            use_clipped_linears=False,
+        )
+        vision_tower = gemma4.VisionModel(vision_config)
+        vision_tower.patch_embedder.input_proj.weight = mx.ones_like(
+            vision_tower.patch_embedder.input_proj.weight
+        )
+        vision_tower.patch_embedder.position_embedding_table = mx.zeros_like(
+            vision_tower.patch_embedder.position_embedding_table
+        )
+
+        pixel_values = mx.ones((1, 3, 48, 48), dtype=mx.float32) * 0.5
+        patch_pixels = vision_tower._patchify_and_pad(pixel_values)
+        patch_positions, padding_positions = vision_tower._patch_positions(pixel_values)
+        inputs_embeds = vision_tower.patch_embedder(
+            patch_pixels,
+            patch_positions,
+            padding_positions,
+        )
+
+        num_real = (48 // vision_config.patch_size) ** 2
+        patch_dim = 3 * vision_config.patch_size**2
+        self.assertTrue(mx.all(inputs_embeds[:, :num_real] == 0).item())
+        self.assertTrue(
+            mx.all(inputs_embeds[:, num_real:] == -float(patch_dim)).item()
+        )
+
+        real_states = mx.ones((1, num_real, vision_config.hidden_size), dtype=mx.float32)
+        pad_states = mx.ones(
+            (
+                1,
+                vision_tower.max_patches - num_real,
+                vision_config.hidden_size,
+            ),
+            dtype=mx.float32,
+        ) * 100.0
+        hidden_states = mx.concatenate([real_states, pad_states], axis=1)
+        pooled, pool_mask = vision_tower.pooler(
+            hidden_states,
+            patch_positions,
+            padding_positions,
+        )
+
+        expected = [
+            vision_config.hidden_size**0.5,
+            vision_config.hidden_size**0.5,
+            0.25 * (vision_config.hidden_size**0.5),
+            0.0,
+        ]
+        self.assertEqual(pool_mask.tolist(), [[True, True, True, False]])
+        for actual, expected_value in zip(pooled[0, :, 0].tolist(), expected):
+            self.assertAlmostEqual(actual, expected_value, places=5)
+
     def test_gemma4_moe(self):
         """Gemma 4 MoE variant: MoE, K-eq-V, no per-layer inputs."""
         from mlx_vlm.models import gemma4

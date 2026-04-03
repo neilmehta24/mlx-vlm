@@ -306,6 +306,13 @@ class VisionPatchEmbedder(nn.Module):
         return position_embeddings
 
     def _patchify(self, pixel_values: mx.array) -> mx.array:
+        if pixel_values.ndim == 3:
+            return pixel_values
+        if pixel_values.ndim != 4:
+            raise ValueError(
+                f"Expected patch pixels or BCHW image tensor, got shape {pixel_values.shape}."
+            )
+
         # pixel_values: [B, C, H, W] (channel-first from processor)
         B, C, H, W = pixel_values.shape
         p = self.patch_size
@@ -315,9 +322,7 @@ class VisionPatchEmbedder(nn.Module):
         # Reshape: [B, C, pH, p, pW, p] -> permute to [B, pH, pW, p, p, C] -> [B, pH*pW, p*p*C]
         patches = pixel_values.reshape(B, C, pH, p, pW, p)
         patches = patches.transpose(0, 2, 4, 3, 5, 1)  # [B, pH, pW, p, p, C]
-        patches = patches.reshape(B, pH * pW, C * p * p)
-        patches = 2 * (patches - 0.5)
-        return self.input_proj(patches.astype(self.input_proj.weight.dtype))
+        return patches.reshape(B, pH * pW, C * p * p)
 
     def __call__(
         self,
@@ -325,7 +330,12 @@ class VisionPatchEmbedder(nn.Module):
         patch_positions: mx.array,
         padding_positions: mx.array,
     ) -> mx.array:
-        hidden_states = self._patchify(pixel_values)
+        # Ref: transformers/src/transformers/models/gemma4/modeling_gemma4.py::
+        # Gemma4VisionPatchEmbedder.forward.
+        # Bug fixed: MLX used to pad with zero embeddings after projection, but HF applies
+        # the `2 * (x - 0.5)` scaling and `input_proj` to padded zero patch pixels too.
+        pixel_values = 2 * (self._patchify(pixel_values) - 0.5)
+        hidden_states = self.input_proj(pixel_values.astype(self.input_proj.weight.dtype))
         position_embeddings = self._position_embeddings(
             patch_positions, padding_positions
         )
@@ -357,6 +367,22 @@ class VisionPooler(nn.Module):
         self, hidden_states, patch_positions, padding_positions, output_length=None
     ):
         length = output_length or self.default_output_length
+        if length > hidden_states.shape[1]:
+            raise ValueError(
+                f"Cannot output more soft tokens (requested {length}) than there are patches "
+                f"({hidden_states.shape[1]})."
+            )
+
+        # Ref: transformers/src/transformers/models/gemma4/modeling_gemma4.py::
+        # Gemma4VisionPooler.forward.
+        # Bug fixed: padded rows must be zeroed before pooling so they cannot leak into
+        # averaged soft tokens.
+        hidden_states = mx.where(
+            mx.expand_dims(padding_positions, -1),
+            mx.array(0.0, dtype=hidden_states.dtype),
+            hidden_states,
+        )
+
         if hidden_states.shape[1] == length:
             mask = padding_positions
         else:
@@ -415,6 +441,14 @@ class VisionModel(nn.Module):
         pW = W // self.patch_size
         num_patches = pH * pW
         num_padding = self.max_patches - num_patches
+        # Ref: transformers/src/transformers/models/gemma4/image_processing_gemma4.py::
+        # Gemma4ImageProcessor._preprocess.
+        # Bug fixed: MLX previously assumed images always fit the HF `max_patches` budget
+        # and could derive invalid padding lengths instead of failing fast here.
+        if num_padding < 0:
+            raise ValueError(
+                f"Image produced {num_patches} patches, but max is {self.max_patches}."
+            )
 
         # Create position grid
         grid_x = np.arange(pW)
@@ -435,28 +469,42 @@ class VisionModel(nn.Module):
 
         return mx.array(patch_positions.astype(np.int32)), mx.array(padding_positions)
 
+    def _patchify_and_pad(self, pixel_values: mx.array) -> mx.array:
+        patch_pixels = self.patch_embedder._patchify(pixel_values)
+        num_padding = self.max_patches - patch_pixels.shape[1]
+        if num_padding < 0:
+            raise ValueError(
+                f"Image produced {patch_pixels.shape[1]} patches, but max is {self.max_patches}."
+            )
+        if num_padding > 0:
+            # Ref: transformers/src/transformers/models/gemma4/image_processing_gemma4.py::
+            # pad_along_first_dim.
+            # Bug fixed: HF pads patch pixels before embedding. The old MLX path embedded
+            # only real patches and then concatenated zero hidden states afterward.
+            pad_patches = mx.zeros(
+                (patch_pixels.shape[0], num_padding, patch_pixels.shape[-1]),
+                dtype=patch_pixels.dtype,
+            )
+            patch_pixels = mx.concatenate([patch_pixels, pad_patches], axis=1)
+        return patch_pixels
+
     def __call__(self, pixel_values: mx.array) -> mx.array:
         if isinstance(pixel_values, list):
             pixel_values = mx.concatenate(pixel_values, axis=0)
 
-        B, C, H, W = pixel_values.shape
-        num_real = (H // self.patch_size) * (W // self.patch_size)
+        patch_pixels = self._patchify_and_pad(pixel_values)
         patch_positions, padding_positions = self._patch_positions(pixel_values)
 
-        # Patchify and embed
+        # Ref: transformers/src/transformers/models/gemma4/modeling_gemma4.py::
+        # Gemma4VisionModel.forward.
+        # Bug fixed: MLX used to send only real patches through `patch_embedder` and then
+        # append zero embeddings, instead of passing the padded patch/position tensors
+        # through the same embedder path as HF.
         inputs_embeds = self.patch_embedder(
-            pixel_values,
-            patch_positions[:, :num_real],
-            padding_positions[:, :num_real],
+            patch_pixels,
+            patch_positions,
+            padding_positions,
         )
-
-        # Pad to max_patches
-        num_padding = self.max_patches - num_real
-        if num_padding > 0:
-            pad_embeds = mx.zeros(
-                (B, num_padding, inputs_embeds.shape[-1]), dtype=inputs_embeds.dtype
-            )
-            inputs_embeds = mx.concatenate([inputs_embeds, pad_embeds], axis=1)
 
         # Build bidirectional attention mask [B, 1, L, L] for SDPA
         valid_mask = ~padding_positions  # True = valid
@@ -487,7 +535,7 @@ class VisionModel(nn.Module):
         # Since pooling produces contiguous valid tokens followed by padding,
         # we can simply count valid tokens and take that many
         all_real = []
-        for i in range(B):
+        for i in range(pooled.shape[0]):
             n_valid = int(valid_mask[i].astype(mx.int32).sum().item())
             all_real.append(pooled[i, :n_valid])
 
