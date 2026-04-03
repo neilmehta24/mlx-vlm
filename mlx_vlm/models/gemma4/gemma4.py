@@ -19,6 +19,77 @@ def masked_scatter(input_tensor, mask, source):
     )
 
 
+def _create_batched_causal_mask(
+    sequence_length: int,
+    batch_size: int,
+    attention_mask: Optional[mx.array] = None,
+    window_size: Optional[int] = None,
+) -> mx.array:
+    query_positions = mx.arange(sequence_length)[:, None]
+    key_positions = mx.arange(sequence_length)[None, :]
+    mask = query_positions >= key_positions
+    if window_size is not None:
+        mask = mask & (query_positions < key_positions + window_size)
+
+    mask = mx.expand_dims(mx.expand_dims(mask, 0), 0)
+    mask = mx.broadcast_to(mask, (batch_size, 1, sequence_length, sequence_length))
+
+    if attention_mask is not None:
+        attention_mask = attention_mask.astype(mx.bool_)
+        query_valid = mx.expand_dims(mx.expand_dims(attention_mask, 1), -1)
+        key_valid = mx.expand_dims(mx.expand_dims(attention_mask, 1), 2)
+        mask = mask & query_valid & key_valid
+
+    return mask
+
+
+def _build_sliding_multimodal_mask(
+    input_ids: mx.array,
+    attention_mask: Optional[mx.array],
+    image_token_id: int,
+    audio_token_id: int,
+    window_size: int,
+) -> mx.array:
+    batch_size, sequence_length = input_ids.shape
+    sliding_mask = _create_batched_causal_mask(
+        sequence_length,
+        batch_size,
+        attention_mask,
+        window_size=window_size,
+    )
+
+    # Ref: transformers/src/transformers/models/gemma4/modeling_gemma4.py::
+    # create_causal_mask_mapping.
+    # Bug fixed: Gemma-4 sliding-attention layers must lift causality inside each
+    # contiguous multimodal soft-token block. The old MLX path used a plain
+    # causal/sliding mask, so image tokens could not attend bidirectionally
+    # within the same image block during prefill.
+    token_type_ids = mx.zeros(input_ids.shape, dtype=mx.int32)
+    token_type_ids = mx.where(input_ids == image_token_id, 1, token_type_ids)
+    token_type_ids = mx.where(input_ids == audio_token_id, 2, token_type_ids)
+    is_multimodal = token_type_ids != 0
+    if not bool(is_multimodal.any().item()) or sequence_length == 1:
+        return sliding_mask
+
+    previous_is_multimodal = mx.concatenate(
+        [mx.zeros((batch_size, 1), dtype=mx.bool_), is_multimodal[:, :-1]],
+        axis=1,
+    )
+    new_multimodal_starts = is_multimodal & ~previous_is_multimodal
+    group_ids = mx.cumsum(new_multimodal_starts.astype(mx.int32), axis=1) - 1
+    group_ids = mx.where(
+        is_multimodal,
+        group_ids,
+        mx.full(group_ids.shape, -1, dtype=group_ids.dtype),
+    )
+
+    query_groups = mx.expand_dims(group_ids, 2)
+    key_groups = mx.expand_dims(group_ids, 1)
+    same_group = (query_groups == key_groups) & (query_groups >= 0)
+    same_group = mx.expand_dims(same_group, 1)
+    return sliding_mask | same_group
+
+
 class MultimodalEmbedder(nn.Module):
     """Projects soft tokens from vision/audio into language model space."""
 
@@ -75,6 +146,7 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
         audio_features: Optional[mx.array] = None,
         audio_mask: Optional[mx.array] = None,
         input_features: Optional[mx.array] = None,
@@ -110,6 +182,19 @@ class Model(nn.Module):
             per_layer_inputs = self.language_model.model.get_per_layer_inputs(
                 llm_input_ids
             )
+
+        multimodal_attention_mask = None
+        if bool(multimodal_mask.any().item()) and input_ids.shape[1] > 1:
+            multimodal_attention_mask = {
+                "full_attention": "causal",
+                "sliding_attention": _build_sliding_multimodal_mask(
+                    input_ids,
+                    mask,
+                    self.config.image_token_id,
+                    self.config.audio_token_id,
+                    self.language_model.model.window_size,
+                ),
+            }
 
         if pixel_values is not None:
             image_features = self.vision_tower(pixel_values)
@@ -149,7 +234,9 @@ class Model(nn.Module):
             )
 
         return InputEmbeddingsFeatures(
-            inputs_embeds=inputs_embeds, per_layer_inputs=per_layer_inputs
+            inputs_embeds=inputs_embeds,
+            mask=multimodal_attention_mask,
+            per_layer_inputs=per_layer_inputs,
         )
 
     def __call__(
@@ -170,6 +257,7 @@ class Model(nn.Module):
             input_ids=None,
             cache=cache,
             inputs_embeds=input_embeddings_features.inputs_embeds,
+            mask=input_embeddings_features.mask,
             per_layer_inputs=input_embeddings_features.per_layer_inputs,
         )
         return logits

@@ -498,7 +498,7 @@ class Gemma4TextModel(nn.Module):
         self,
         inputs: mx.array = None,
         inputs_embeds: Optional[mx.array] = None,
-        mask: Optional[mx.array] = None,
+        mask: Optional[Any] = None,
         cache=None,
         per_layer_inputs: Optional[mx.array] = None,
         **kwargs,
@@ -515,6 +515,19 @@ class Gemma4TextModel(nn.Module):
             # been projected into text space.
             h = inputs_embeds
 
+        cache_offset = next(
+            (
+                int(
+                    c.offset
+                    if not isinstance(c.offset, mx.array)
+                    else (c.offset if c.offset.ndim == 0 else c.offset[0]).item()
+                )
+                for c in (cache or [])
+                if c is not None and hasattr(c, "offset")
+            ),
+            0,
+        )
+
         if self.hidden_size_per_layer_input:
             if inputs is not None and per_layer_inputs is None:
                 per_layer_inputs = self.get_per_layer_inputs(inputs)
@@ -522,24 +535,40 @@ class Gemma4TextModel(nn.Module):
                 # Slice per_layer_inputs to match current chunk (chunked prefill)
                 target_len = h.shape[1]
                 if per_layer_inputs.shape[1] != target_len:
-                    cache_offset = next(
-                        (
-                            int(c.offset)
-                            for c in (cache or [])
-                            if c is not None and hasattr(c, "offset")
-                        ),
-                        0,
-                    )
                     max_start = max(per_layer_inputs.shape[1] - target_len, 0)
                     start = min(cache_offset, max_start)
                     per_layer_inputs = per_layer_inputs[:, start : start + target_len]
             if per_layer_inputs is not None or inputs is not None:
                 per_layer_inputs = self.project_per_layer_inputs(h, per_layer_inputs)
 
+        mask_mapping = None
+        if isinstance(mask, dict):
+            # Ref: transformers/src/transformers/models/gemma4/modeling_gemma4.py::
+            # create_causal_mask_mapping / Gemma4TextModel.forward.
+            # Bug fixed: Gemma-4 can receive different masks per layer type during
+            # multimodal prefill. The old MLX path only accepted a single generic
+            # causal mask, so sliding-attention layers never got HF's image-block
+            # bidirectional override. Slice any precomputed mask mapping to the
+            # current chunk during chunked prefill.
+            target_len = h.shape[1]
+            mask_mapping = {}
+            for layer_type, layer_mask in mask.items():
+                if isinstance(layer_mask, mx.array):
+                    if (
+                        layer_mask.shape[-2] != target_len
+                        or layer_mask.shape[-1] != target_len + cache_offset
+                    ):
+                        max_start = max(layer_mask.shape[-2] - target_len, 0)
+                        start = min(cache_offset, max_start)
+                        end = start + target_len
+                        key_end = min(end, layer_mask.shape[-1])
+                        layer_mask = layer_mask[..., start:end, :key_end]
+                mask_mapping[layer_type] = layer_mask
+
         if cache is None:
             cache = [None] * self.first_kv_shared_layer_idx
 
-        if mask is None:
+        if mask_mapping is None and mask is None:
             global_mask = create_attention_mask(
                 h,
                 (
@@ -563,7 +592,9 @@ class Gemma4TextModel(nn.Module):
             is_global = layer.layer_type == "full_attention"
 
             local_mask = mask
-            if mask is None and is_global:
+            if mask_mapping is not None:
+                local_mask = mask_mapping.get(layer.layer_type)
+            elif mask is None and is_global:
                 local_mask = global_mask
             elif mask is None:
                 local_mask = sliding_window_mask
@@ -594,7 +625,7 @@ class LanguageModel(nn.Module):
         self,
         inputs: mx.array = None,
         inputs_embeds: Optional[mx.array] = None,
-        mask: Optional[mx.array] = None,
+        mask: Optional[Any] = None,
         cache=None,
         per_layer_inputs: Optional[mx.array] = None,
         **kwargs,

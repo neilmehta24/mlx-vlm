@@ -2449,6 +2449,202 @@ class TestModels(unittest.TestCase):
             atol=1e-5,
         )
 
+    def test_gemma4_model_get_input_embeddings_builds_sliding_multimodal_mask(self):
+        from mlx_vlm.models import gemma4
+
+        class DummyVisionTower(nn.Module):
+            def __init__(self, output):
+                super().__init__()
+                self.output = output
+
+            def __call__(self, pixel_values):
+                return self.output
+
+        class Identity(nn.Module):
+            def __call__(self, x):
+                return x
+
+        model = gemma4.Model(
+            gemma4.ModelConfig(
+                text_config=gemma4.TextConfig(
+                    hidden_size=4,
+                    num_hidden_layers=2,
+                    intermediate_size=8,
+                    num_attention_heads=1,
+                    num_key_value_heads=1,
+                    head_dim=4,
+                    global_head_dim=4,
+                    vocab_size=64,
+                    hidden_size_per_layer_input=0,
+                    num_kv_shared_layers=0,
+                    sliding_window=2,
+                    sliding_window_pattern=2,
+                    layer_types=["sliding_attention", "full_attention"],
+                ),
+                vision_config=gemma4.VisionConfig(
+                    hidden_size=4,
+                    num_hidden_layers=1,
+                    intermediate_size=8,
+                    num_attention_heads=1,
+                    num_key_value_heads=1,
+                    head_dim=4,
+                    patch_size=16,
+                    pooling_kernel_size=2,
+                    default_output_length=4,
+                    position_embedding_size=64,
+                    use_clipped_linears=False,
+                ),
+            )
+        )
+
+        model.language_model.model.embed_tokens.weight = mx.zeros((64, 4), dtype=mx.float32)
+        model.vision_tower = DummyVisionTower(
+            mx.zeros((1, 4, 4), dtype=mx.float32)
+        )
+        model.embed_vision = Identity()
+
+        input_ids = mx.array(
+            [[11, model.config.image_token_id, model.config.image_token_id, 12, model.config.image_token_id, model.config.image_token_id, 13]],
+            dtype=mx.int32,
+        )
+        outputs = model.get_input_embeddings(
+            input_ids=input_ids,
+            pixel_values=mx.zeros((1, 3, 16, 16), dtype=mx.float32),
+            mask=mx.ones((1, 7), dtype=mx.bool_),
+        )
+
+        self.assertIsInstance(outputs.mask, dict)
+        self.assertEqual(outputs.mask["full_attention"], "causal")
+
+        sliding_mask = np.array(outputs.mask["sliding_attention"].tolist(), dtype=bool)
+
+        self.assertTrue(sliding_mask[0, 0, 1, 2])
+        self.assertTrue(sliding_mask[0, 0, 2, 1])
+        self.assertTrue(sliding_mask[0, 0, 4, 5])
+        self.assertTrue(sliding_mask[0, 0, 5, 4])
+
+        self.assertFalse(sliding_mask[0, 0, 2, 4])
+        self.assertFalse(sliding_mask[0, 0, 5, 1])
+        self.assertFalse(sliding_mask[0, 0, 0, 1])
+        self.assertTrue(sliding_mask[0, 0, 6, 5])
+
+    def test_gemma4_text_model_uses_layer_type_mask_mapping(self):
+        from mlx_vlm.models import gemma4
+        from mlx_vlm.models.gemma4.language import Gemma4TextModel
+
+        class Identity(nn.Module):
+            def __call__(self, x):
+                return x
+
+        class CaptureLayer(nn.Module):
+            def __init__(self, layer_type):
+                super().__init__()
+                self.layer_type = layer_type
+                self.last_mask = None
+
+            def __call__(self, x, mask, cache, per_layer_input=None):
+                self.last_mask = mask
+                return x
+
+        text_model = Gemma4TextModel(
+            gemma4.TextConfig(
+                hidden_size=4,
+                num_hidden_layers=2,
+                intermediate_size=8,
+                num_attention_heads=1,
+                num_key_value_heads=1,
+                head_dim=4,
+                global_head_dim=4,
+                vocab_size=16,
+                hidden_size_per_layer_input=0,
+                num_kv_shared_layers=0,
+                sliding_window=4,
+                sliding_window_pattern=2,
+                layer_types=["full_attention", "sliding_attention"],
+            )
+        )
+        capture_full = CaptureLayer("full_attention")
+        capture_sliding = CaptureLayer("sliding_attention")
+        text_model.layers = [capture_full, capture_sliding]
+        text_model.norm = Identity()
+
+        sliding_mask = mx.ones((1, 1, 3, 3), dtype=mx.bool_)
+        outputs = text_model(
+            inputs_embeds=mx.zeros((1, 3, 4), dtype=mx.float32),
+            mask={
+                "full_attention": "causal",
+                "sliding_attention": sliding_mask,
+            },
+        )
+
+        self.assertEqual(capture_full.last_mask, "causal")
+        np.testing.assert_array_equal(
+            np.array(capture_sliding.last_mask.tolist(), dtype=bool),
+            np.array(sliding_mask.tolist(), dtype=bool),
+        )
+        np.testing.assert_allclose(
+            np.array(outputs.tolist(), dtype=np.float32),
+            np.zeros((1, 3, 4), dtype=np.float32),
+        )
+
+    def test_gemma4_text_model_slices_layer_type_mask_mapping_for_chunked_prefill(self):
+        from mlx_vlm.models import gemma4
+        from mlx_vlm.models.gemma4.language import Gemma4TextModel
+
+        class Identity(nn.Module):
+            def __call__(self, x):
+                return x
+
+        class CaptureLayer(nn.Module):
+            def __init__(self, layer_type):
+                super().__init__()
+                self.layer_type = layer_type
+                self.last_mask = None
+
+            def __call__(self, x, mask, cache, per_layer_input=None):
+                self.last_mask = mask
+                return x
+
+        class DummyCache:
+            def __init__(self, offset):
+                self.offset = offset
+
+        text_model = Gemma4TextModel(
+            gemma4.TextConfig(
+                hidden_size=4,
+                num_hidden_layers=1,
+                intermediate_size=8,
+                num_attention_heads=1,
+                num_key_value_heads=1,
+                head_dim=4,
+                global_head_dim=4,
+                vocab_size=16,
+                hidden_size_per_layer_input=0,
+                num_kv_shared_layers=0,
+                sliding_window=4,
+                sliding_window_pattern=1,
+                layer_types=["sliding_attention"],
+            )
+        )
+        capture_layer = CaptureLayer("sliding_attention")
+        text_model.layers = [capture_layer]
+        text_model.norm = Identity()
+
+        full_mask = mx.arange(36, dtype=mx.int32).reshape(1, 1, 6, 6)
+        text_model(
+            inputs_embeds=mx.zeros((1, 2, 4), dtype=mx.float32),
+            mask={
+                "full_attention": "causal",
+                "sliding_attention": full_mask,
+            },
+            cache=[DummyCache(offset=2)],
+        )
+
+        np.testing.assert_array_equal(
+            np.array(capture_layer.last_mask.tolist(), dtype=np.int32),
+            np.arange(36, dtype=np.int32).reshape(1, 1, 6, 6)[..., 2:4, :4],
+        )
+
     def test_gemma4_moe(self):
         """Gemma 4 MoE variant: MoE, K-eq-V, no per-layer inputs."""
         from mlx_vlm.models import gemma4

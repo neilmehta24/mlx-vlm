@@ -2,7 +2,7 @@ import inspect
 import math
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -63,6 +63,7 @@ class LanguageModelOutput:
 @dataclass
 class InputEmbeddingsFeatures:
     inputs_embeds: mx.array
+    mask: Optional[Any] = None
     attention_mask_4d: Optional[mx.array] = None
     visual_pos_masks: Optional[mx.array] = None
     deepstack_visual_embeds: Optional[mx.array] = None
@@ -76,6 +77,7 @@ class InputEmbeddingsFeatures:
     def to_dict(self):
         return {
             "inputs_embeds": self.inputs_embeds,
+            "mask": self.mask,
             "attention_mask_4d": self.attention_mask_4d,
             "visual_pos_masks": self.visual_pos_masks,
             "deepstack_visual_embeds": self.deepstack_visual_embeds,
