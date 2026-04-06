@@ -6,6 +6,81 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
+def _rotate_half(x: mx.array, traditional: bool) -> mx.array:
+    if traditional:
+        x_even = x[..., ::2]
+        x_odd = x[..., 1::2]
+        return mx.stack((-x_odd, x_even), axis=-1).reshape(x.shape)
+
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return mx.concatenate((-x2, x1), axis=-1)
+
+
+class DefaultRoPE(nn.Module):
+    """HF-style default RoPE using explicit rotate_half math."""
+
+    def __init__(
+        self,
+        dims: int,
+        traditional: bool = False,
+        base: float = 10000.0,
+        scaling_config: Optional[dict] = None,
+    ):
+        super().__init__()
+        self.dims = dims
+        self.traditional = traditional
+
+        scaling_config = scaling_config or {}
+        partial_rotary_factor = scaling_config.get("partial_rotary_factor", 1.0)
+        self.rotated_dims = min(dims, 2 * int(partial_rotary_factor * dims // 2))
+
+        if self.rotated_dims > 0:
+            exponents = mx.arange(0, self.rotated_dims, 2, dtype=mx.float32) / dims
+            self._inv_freq = 1.0 / (base**exponents)
+        else:
+            self._inv_freq = None
+
+    def __call__(self, x, offset=0):
+        if self.rotated_dims <= 0:
+            return x
+
+        head = x[..., : self.rotated_dims]
+        tail = x[..., self.rotated_dims :]
+        seq_len = head.shape[-2]
+        seq_positions = mx.arange(seq_len, dtype=mx.float32)
+
+        if isinstance(offset, mx.array):
+            offset = offset.astype(mx.float32)
+            if offset.ndim == 0:
+                positions = seq_positions + offset
+                freqs = positions[:, None] * self._inv_freq[None, :]
+                emb = mx.concatenate((freqs, freqs), axis=-1)
+                cos = mx.reshape(mx.cos(emb), (1, 1, seq_len, self.rotated_dims))
+                sin = mx.reshape(mx.sin(emb), (1, 1, seq_len, self.rotated_dims))
+            else:
+                positions = offset[:, None] + seq_positions[None, :]
+                freqs = positions[..., None] * self._inv_freq[None, None, :]
+                emb = mx.concatenate((freqs, freqs), axis=-1)
+                cos = mx.expand_dims(mx.cos(emb), axis=1)
+                sin = mx.expand_dims(mx.sin(emb), axis=1)
+        else:
+            positions = seq_positions + float(offset)
+            freqs = positions[:, None] * self._inv_freq[None, :]
+            emb = mx.concatenate((freqs, freqs), axis=-1)
+            cos = mx.reshape(mx.cos(emb), (1, 1, seq_len, self.rotated_dims))
+            sin = mx.reshape(mx.sin(emb), (1, 1, seq_len, self.rotated_dims))
+
+        cos = cos.astype(head.dtype)
+        sin = sin.astype(head.dtype)
+        rotated = _rotate_half(head, traditional=self.traditional)
+        head = (head * cos) + (rotated * sin)
+
+        if tail.shape[-1] == 0:
+            return head
+        return mx.concatenate((head, tail), axis=-1)
+
+
 class ProportionalRoPE(nn.Module):
     """Proportional RoPE for Gemma 4 full-attention layers.
 
@@ -106,5 +181,10 @@ def initialize_rope(
             scaling_config=scaling_config,
         )
 
-    # Default: standard RoPE
-    return nn.RoPE(dims, traditional=traditional, base=base)
+    # Default: explicit HF-style rotate_half RoPE for tighter text parity.
+    return DefaultRoPE(
+        dims=dims,
+        traditional=traditional,
+        base=base,
+        scaling_config=scaling_config,
+    )

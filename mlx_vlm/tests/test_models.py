@@ -2246,6 +2246,66 @@ class TestModels(unittest.TestCase):
 
         # TODO: Add test for vision model. Ensure I can pass input type and shapes.
 
+    def test_gemma4_text_rmsnorm_matches_float32_reference(self):
+        from mlx_vlm.models.gemma4.language import (
+            RMSNorm,
+            RMSNormNoScale,
+            RMSNormZeroShift,
+        )
+
+        x = mx.array([[[1.0, -2.0, 3.0, -4.0]]], dtype=mx.float16)
+        x_float = x.astype(mx.float32)
+        mean_squared = mx.mean(x_float * x_float, axis=-1, keepdims=True) + 1e-6
+        base_expected = (x_float * mx.power(mean_squared, -0.5)).astype(x.dtype)
+
+        no_scale = RMSNormNoScale(4, eps=1e-6)
+        self.assertTrue(mx.array_equal(no_scale(x), base_expected))
+
+        with_scale = RMSNorm(4, eps=1e-6)
+        self.assertTrue(mx.array_equal(with_scale(x), base_expected))
+
+        zero_shift = RMSNormZeroShift(4, eps=1e-6)
+        zero_shift.weight = mx.array([1.0, 0.5, -1.0, 2.0], dtype=mx.float16)
+        zero_shift_expected = (
+            x_float
+            * mx.power(mean_squared, -0.5)
+            * zero_shift.weight.astype(mx.float32)
+        ).astype(x.dtype)
+        self.assertTrue(mx.array_equal(zero_shift(x), zero_shift_expected))
+
+    def test_gemma4_default_rope_matches_rotate_half_reference(self):
+        from mlx_vlm.models.gemma4.rope_utils import initialize_rope
+
+        x = mx.arange(24, dtype=mx.float32).reshape(1, 1, 3, 8)
+        rope = initialize_rope(
+            dims=8,
+            base=10000.0,
+            traditional=False,
+            scaling_config={"type": "default", "partial_rotary_factor": 0.5},
+        )
+
+        output = rope(x, offset=3)
+
+        rotated_dims = 4
+        head = x[..., :rotated_dims]
+        tail = x[..., rotated_dims:]
+
+        inv_freq = 1.0 / (
+            10000.0 ** (mx.arange(0, rotated_dims, 2, dtype=mx.float32) / 8)
+        )
+        positions = mx.arange(head.shape[-2], dtype=mx.float32) + 3
+        freqs = positions[:, None] * inv_freq[None, :]
+        emb = mx.concatenate((freqs, freqs), axis=-1)
+        cos = mx.reshape(mx.cos(emb), (1, 1, head.shape[-2], rotated_dims))
+        sin = mx.reshape(mx.sin(emb), (1, 1, head.shape[-2], rotated_dims))
+        rotated = mx.concatenate(
+            (-head[..., head.shape[-1] // 2 :], head[..., : head.shape[-1] // 2]),
+            axis=-1,
+        )
+        expected = mx.concatenate((head * cos + rotated * sin, tail), axis=-1)
+
+        self.assertTrue(mx.array_equal(output, expected))
+
     def test_jina_vlm(self):
         from mlx_vlm.models import jina_vlm
 
